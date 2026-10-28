@@ -53,6 +53,86 @@ class TranscriptionTests(unittest.TestCase):
         self.assertTrue(updates[-1][3]["interactive"])
         self.assertFalse(updates[-1][4]["interactive"])
 
+    def test_hosted_provider_transcribes_audio_without_loading_local_model(self):
+        response = SimpleNamespace(
+            ok=True,
+            status_code=200,
+            json=lambda: {"text": "hosted transcript"},
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            audio_path = self.make_wav(directory)
+            with patch.object(app.requests, "post", return_value=response) as post:
+                with patch.object(app, "get_model") as get_model:
+                    updates = list(
+                        app.transcribe_audio(
+                            str(audio_path),
+                            provider="openai-compatible",
+                            api_model="whisper-1",
+                            api_key="test-api-key",
+                        )
+                    )
+
+        self.assertIn("hosted transcript", updates[-1][0])
+        self.assertIn("Timestamps are not provided", updates[-1][1])
+        self.assertIn("Hosted transcription complete", updates[-1][2])
+        post.assert_called_once()
+        self.assertEqual(
+            post.call_args.kwargs["headers"]["Authorization"],
+            "Bearer test-api-key",
+        )
+        self.assertEqual(post.call_args.kwargs["data"]["model"], "whisper-1")
+        get_model.assert_not_called()
+
+    def test_hosted_provider_requires_api_key(self):
+        with tempfile.TemporaryDirectory() as directory:
+            audio_path = self.make_wav(directory)
+            with patch.object(app.requests, "post") as post:
+                updates = list(
+                    app.transcribe_audio(
+                        str(audio_path),
+                        provider="openai-compatible",
+                        api_key="",
+                    )
+                )
+
+        self.assertIn("Enter an API key", updates[-1][2])
+        post.assert_not_called()
+
+    def test_hosted_provider_rejects_non_https_remote_url(self):
+        with tempfile.TemporaryDirectory() as directory:
+            audio_path = self.make_wav(directory)
+            with patch.object(app.requests, "post") as post:
+                updates = list(
+                    app.transcribe_audio(
+                        str(audio_path),
+                        provider="openai-compatible",
+                        api_base_url="http://provider.example/v1",
+                        api_key="test-api-key",
+                    )
+                )
+
+        self.assertIn("Use an HTTPS provider URL", updates[-1][2])
+        post.assert_not_called()
+
+    def test_hosted_provider_response_error_is_actionable(self):
+        response = SimpleNamespace(
+            ok=False,
+            status_code=401,
+            json=lambda: {"error": {"message": "Invalid API key"}},
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            audio_path = self.make_wav(directory)
+            with patch.object(app.requests, "post", return_value=response):
+                updates = list(
+                    app.transcribe_audio(
+                        str(audio_path),
+                        provider="openai-compatible",
+                        api_key="test-api-key",
+                    )
+                )
+
+        self.assertIn("HTTP 401: Invalid API key", updates[-1][2])
+
     def test_upload_over_limit_is_rejected_before_loading_model(self):
         with patch.object(app.os.path, "getsize", return_value=app.MAX_AUDIO_SIZE_BYTES + 1):
             with patch.object(app, "get_model") as get_model:

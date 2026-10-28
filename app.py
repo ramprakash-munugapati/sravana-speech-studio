@@ -8,13 +8,16 @@ import inspect
 import json
 import logging
 import math
+import mimetypes
 import os
 from functools import lru_cache
+from urllib.parse import urlsplit
 
 import av
 import ctranslate2
 import gradio as gr
 import numpy as np
+import requests
 from faster_whisper import WhisperModel
 
 # -------------------------
@@ -22,8 +25,8 @@ from faster_whisper import WhisperModel
 # -------------------------
 BRAND_NAME = "Sravana Speech Studio"
 APP_DESCRIPTION = (
-    "Telugu-first, local speech-to-text for audio recordings. "
-    "Transcribe 100 Whisper-supported languages with live progress and timestamps."
+    "Telugu-first speech-to-text with local Whisper or a compatible hosted "
+    "transcription model. Powered by Aadhya Labs."
 )
 APP_TITLE = "Sravana Speech Studio | Telugu Speech-to-Text"
 FAQ_ITEMS = [
@@ -37,8 +40,9 @@ FAQ_ITEMS = [
     (
         "Does my audio leave my computer?",
         "When you run Sravana on your own computer, audio is transcribed there "
-        "and is not sent to an external transcription API. Internet access may "
-        "be needed once to download a Whisper model.",
+        "and is not sent to an external transcription API in Local Whisper mode. "
+        "Hosted provider mode sends audio to the provider you configure; check "
+        "its privacy and pricing terms before use.",
     ),
     (
         "What is the maximum audio upload size?",
@@ -112,6 +116,14 @@ class AudioInputError(Exception):
     """Raised when an uploaded file does not contain usable audio."""
 
 
+class ProviderConfigurationError(Exception):
+    """Raised when a hosted transcription provider is not configured correctly."""
+
+
+class ProviderRequestError(Exception):
+    """Raised when a hosted transcription provider cannot complete a request."""
+
+
 DEFAULT_CPU_THREADS = min(4, max(1, (os.cpu_count() or 2) // 2))
 CPU_THREADS = max(
     1,
@@ -176,6 +188,8 @@ def format_audio_time(seconds):
 def describe_transcription_error(error, phase, model_size):
     if isinstance(error, AudioInputError):
         return str(error)
+    if isinstance(error, (ProviderConfigurationError, ProviderRequestError)):
+        return str(error)
     if isinstance(error, FileNotFoundError):
         return "The uploaded audio is no longer available. Upload it again and retry."
     if isinstance(error, PermissionError):
@@ -204,6 +218,103 @@ def describe_transcription_error(error, phase, model_size):
         f"An unexpected error occurred while {phase}. "
         "Check the app terminal for details, then retry."
     )
+
+
+def transcribe_with_provider(audio_path, language, api_base_url, api_model, api_key):
+    """Send an audio file to an OpenAI-compatible transcription endpoint."""
+    api_base_url = api_base_url.strip().rstrip("/")
+    api_model = api_model.strip()
+    api_key = api_key.strip()
+
+    if not api_key:
+        raise ProviderConfigurationError(
+            "Enter an API key for the selected hosted provider."
+        )
+    if not api_model:
+        raise ProviderConfigurationError(
+            "Enter the transcription model name from your provider."
+        )
+
+    parsed_url = urlsplit(api_base_url)
+    if (
+        parsed_url.scheme not in {"https", "http"}
+        or not parsed_url.hostname
+        or parsed_url.username
+        or parsed_url.password
+        or parsed_url.query
+        or parsed_url.fragment
+    ):
+        raise ProviderConfigurationError(
+            "Enter a valid provider base URL, such as https://api.openai.com/v1."
+        )
+    if parsed_url.scheme != "https" and parsed_url.hostname not in {
+        "localhost",
+        "127.0.0.1",
+        "::1",
+    }:
+        raise ProviderConfigurationError(
+            "Use an HTTPS provider URL to protect your API key and audio."
+        )
+
+    headers = {"Authorization": f"Bearer {api_key}"}
+    data = {"model": api_model, "response_format": "json"}
+    if language is not None:
+        data["language"] = language
+    endpoint = f"{api_base_url}/audio/transcriptions"
+    content_type = mimetypes.guess_type(audio_path)[0] or "application/octet-stream"
+
+    try:
+        with open(audio_path, "rb") as audio_file:
+            response = requests.post(
+                endpoint,
+                headers=headers,
+                data=data,
+                files={
+                    "file": (
+                        os.path.basename(audio_path),
+                        audio_file,
+                        content_type,
+                    )
+                },
+                timeout=(15, 600),
+            )
+    except requests.RequestException as error:
+        raise ProviderRequestError(
+            "Could not reach the hosted transcription provider. Check the URL "
+            "and your internet connection, then try again."
+        ) from error
+
+    if not response.ok:
+        try:
+            error_body = response.json()
+            provider_error = error_body.get("error", error_body)
+            detail = (
+                provider_error.get("message", "")
+                if isinstance(provider_error, dict)
+                else str(provider_error)
+            )
+        except (ValueError, AttributeError):
+            detail = ""
+        if not detail:
+            detail = "Check your API key, model name, and provider limits."
+        raise ProviderRequestError(
+            f"The hosted provider returned HTTP {response.status_code}: "
+            f"{detail[:300]}"
+        )
+
+    try:
+        result = response.json()
+    except ValueError as error:
+        raise ProviderRequestError(
+            "The hosted provider returned an unreadable response. Check that the "
+            "selected model supports audio transcription."
+        ) from error
+    text = result.get("text") if isinstance(result, dict) else None
+    if not isinstance(text, str):
+        raise ProviderRequestError(
+            "The hosted provider response did not contain transcript text."
+        )
+    return text.strip()
 
 
 def iter_audio_chunks(audio_path, chunk_duration=CHUNK_DURATION_SECONDS):
@@ -263,7 +374,16 @@ def iter_audio_chunks(audio_path, chunk_duration=CHUNK_DURATION_SECONDS):
         yield chunk_start, audio, duration
 
 
-def transcribe_audio(audio_path, language="te", beam_size=1, model_size=MODEL_SIZE):
+def transcribe_audio(
+    audio_path,
+    language="te",
+    beam_size=1,
+    model_size=MODEL_SIZE,
+    provider="local",
+    api_base_url="https://api.openai.com/v1",
+    api_model="whisper-1",
+    api_key="",
+):
     """Transcribe audio in chunks, yielding partial text and progress."""
     if audio_path is None:
         yield ui_update("", "", "Choose an audio file before starting transcription.")
@@ -307,12 +427,47 @@ def transcribe_audio(audio_path, language="te", beam_size=1, model_size=MODEL_SI
             )
             return
 
-        if model_size not in MODEL_CHOICES:
+        if provider not in {"local", "openai-compatible"}:
+            yield ui_update("", "", "Choose a supported transcription provider.")
+            return
+
+        if provider == "local" and model_size not in MODEL_CHOICES:
             logger.warning("Rejected unsupported Whisper model selection: %r", model_size)
             yield ui_update(
                 "",
                 "",
                 "That model choice is not supported. Select a model from the list and retry.",
+            )
+            return
+
+        if provider == "openai-compatible":
+            phase = "contacting the hosted transcription provider"
+            yield ui_update(
+                "",
+                "",
+                "☁️ Sending your audio to the selected provider for transcription...",
+                running=True,
+            )
+            text = transcribe_with_provider(
+                audio_path,
+                language,
+                api_base_url,
+                api_model,
+                api_key,
+            )
+            yield ui_update(
+                text,
+                (
+                    "Timestamps are not provided by the selected hosted model.\n\n"
+                    + text
+                    if text
+                    else ""
+                ),
+                (
+                    "✅ Hosted transcription complete"
+                    if text
+                    else "⚠️ The hosted model returned no speech."
+                ),
             )
             return
 
@@ -484,7 +639,7 @@ STRUCTURED_DATA = json.dumps(
                 "featureList": [
                     "Telugu speech-to-text transcription",
                     f"Transcription in {LANGUAGE_COUNT} Whisper-supported languages",
-                    "Local audio processing",
+                    "Local and compatible hosted transcription providers",
                     "Live transcription progress and timestamps",
                     "Audio upload limit of 250 MB",
                 ],
@@ -604,36 +759,73 @@ with gr.Blocks(title=title) as demo:
             )
 
             gr.Markdown("### 2 · Transcription settings")
-            model_selector = gr.Dropdown(
+            provider_selector = gr.Dropdown(
                 choices=[
-                    ("Tiny · fastest, lower accuracy", "tiny"),
-                    ("Base · fast, improved accuracy", "base"),
-                    ("Small · balanced", "small"),
-                    ("Medium · higher accuracy, slower on CPU", "medium"),
-                    ("Large v2 · highest accuracy, slowest", "large-v2"),
-                    ("Large v3 · highest accuracy, slowest", "large-v3"),
+                    ("Local Whisper · private and offline", "local"),
+                    ("Hosted API · OpenAI-compatible", "openai-compatible"),
                 ],
-                value=MODEL_SIZE,
-                label="Whisper model",
-                info="A model is downloaded the first time you use it. Only one model is kept in memory at a time.",
+                value="local",
+                label="Transcription provider",
+                info="Local Whisper is the simplest private option. Hosted APIs may have usage fees.",
             )
+            with gr.Group(visible=True) as local_settings:
+                model_selector = gr.Dropdown(
+                    choices=[
+                        ("Tiny · fastest, lower accuracy", "tiny"),
+                        ("Base · fast, improved accuracy", "base"),
+                        ("Small · balanced", "small"),
+                        ("Medium · higher accuracy, slower on CPU", "medium"),
+                        ("Large v2 · highest accuracy, slowest", "large-v2"),
+                        ("Large v3 · highest accuracy, slowest", "large-v3"),
+                    ],
+                    value=MODEL_SIZE,
+                    label="Whisper model",
+                    info="A model is downloaded the first time you use it. Only one model is kept in memory at a time.",
+                )
+                beam_size = gr.Slider(
+                    minimum=1,
+                    maximum=10,
+                    value=1,
+                    step=1,
+                    label="Accuracy vs. speed",
+                    info="1 is fastest; higher values may improve accuracy but take longer.",
+                )
+                gr.Markdown(
+                    f"**Compute:** `{DEVICE}` · `{COMPUTE_TYPE}` · "
+                    f"`{CPU_THREADS if DEVICE == 'cpu' else 'GPU'}` threads"
+                )
+            with gr.Group(visible=False) as hosted_settings:
+                gr.Markdown(
+                    "Connect any provider that supports the OpenAI-compatible "
+                    "`/audio/transcriptions` API. For example, OpenAI uses "
+                    "`https://api.openai.com/v1` and model `whisper-1`; Groq uses "
+                    "`https://api.groq.com/openai/v1` and model `whisper-large-v3`."
+                )
+                api_base_url = gr.Textbox(
+                    value="https://api.openai.com/v1",
+                    label="Provider base URL",
+                    placeholder="https://api.openai.com/v1",
+                )
+                api_model = gr.Textbox(
+                    value="whisper-1",
+                    label="Transcription model",
+                    placeholder="whisper-1",
+                )
+                api_key = gr.Textbox(
+                    label="API key",
+                    placeholder="Paste your provider API key",
+                    type="password",
+                )
+                gr.Markdown(
+                    "Your key is used for this request only and is not saved by "
+                    "Sravana. Hosted mode sends the full audio file to that provider; "
+                    "its privacy policy, file limits, and charges apply."
+                )
             language = gr.Dropdown(
                 choices=[("Auto detect", None), *SUPPORTED_LANGUAGE_CHOICES],
                 value="te",
                 label="Audio language",
                 info=f"Select from {LANGUAGE_COUNT} Whisper-supported languages or let the app detect it.",
-            )
-            beam_size = gr.Slider(
-                minimum=1,
-                maximum=10,
-                value=1,
-                step=1,
-                label="Accuracy vs. speed",
-                info="1 is fastest; higher values may improve accuracy but take longer.",
-            )
-            gr.Markdown(
-                f"**Compute:** `{DEVICE}` · `{COMPUTE_TYPE}` · "
-                f"`{CPU_THREADS if DEVICE == 'cpu' else 'GPU'}` threads"
             )
             with gr.Row():
                 transcribe_btn = gr.Button(
@@ -678,10 +870,32 @@ with gr.Blocks(title=title) as demo:
 
     transcribe_event = transcribe_btn.click(
         fn=transcribe_audio,
-        inputs=[audio_input, language, beam_size, model_selector],
+        inputs=[
+            audio_input,
+            language,
+            beam_size,
+            model_selector,
+            provider_selector,
+            api_base_url,
+            api_model,
+            api_key,
+        ],
         outputs=[text_output, timestamp_output, progress_output, transcribe_btn, stop_btn],
         concurrency_limit=1,
         show_progress="hidden",
+    )
+
+    def toggle_provider_settings(selected_provider):
+        return (
+            gr.update(visible=selected_provider == "local"),
+            gr.update(visible=selected_provider == "openai-compatible"),
+        )
+
+    provider_selector.change(
+        fn=toggle_provider_settings,
+        inputs=provider_selector,
+        outputs=[local_settings, hosted_settings],
+        queue=False,
     )
 
     def stop_transcription():
@@ -705,7 +919,7 @@ with gr.Blocks(title=title) as demo:
         )
 
     gr.Markdown(
-        f"Chunked, local transcription · {CHUNK_DURATION_SECONDS}-second chunks · "
+        f"Powered by Aadhya Labs · Local {CHUNK_DURATION_SECONDS}-second chunks · "
         f"{LANGUAGE_COUNT} supported language codes",
         elem_classes=["app-footer"],
     )

@@ -1,9 +1,10 @@
 # Sravana Speech Studio — Telugu Speech-to-Text
 
 **Sravana** is a Telugu-first, multilingual audio transcription app powered by
-[Faster-Whisper](https://github.com/SYSTRAN/faster-whisper). Transcribe audio
-recordings in a local Gradio web app, follow live chunk-by-chunk progress, and
-copy plain text or timestamped results.
+[Faster-Whisper](https://github.com/SYSTRAN/faster-whisper) and Aadhya Labs.
+Use local Whisper or connect a hosted, OpenAI-compatible transcription API.
+Transcribe recordings in a Gradio web app and copy plain text or timestamped
+local results.
 
 Search: Telugu speech to text · Telugu audio transcription · speech recognition
 for Telugu · multilingual audio to text · offline Whisper transcription.
@@ -20,6 +21,7 @@ quality, accents, and background noise.
 ## Features
 
 - Telugu-first speech recognition with selectable Whisper models
+- Optional OpenAI-compatible hosted speech-to-text APIs, including OpenAI and Groq
 - Multilingual speech-to-text, including English, Hindi, Tamil, Kannada, and Malayalam
 - Local Gradio web UI and command-line transcription tool
 - Processes long recordings in 60-second chunks and shows partial transcription and progress
@@ -66,11 +68,30 @@ python app.py
 ### Using the web app
 
 1. Upload an audio file (up to 250 MiB) or record from your microphone.
-2. Select the spoken language, or choose **Auto detect**.
-3. Pick a Whisper model and beam size. Tiny and beam size 1 are fastest; larger
-   models or beam sizes may improve accuracy and take longer.
-4. Choose **Transcribe audio**. Read partial text and progress as chunks finish.
-5. Choose **Stop** to cancel. Text already produced remains available.
+2. Choose **Local Whisper** for on-device transcription or **Hosted API** to
+   connect an OpenAI-compatible transcription provider.
+3. For local transcription, select the spoken language and pick a Whisper model
+   and beam size. Tiny and beam size 1 are fastest; larger models or beam sizes
+   may improve accuracy and take longer.
+4. For a hosted provider, enter its base URL, transcription model, and API key.
+   The key is not saved in Sravana's app settings.
+5. Choose **Transcribe audio**. Local mode shows partial text as chunks finish;
+   hosted mode sends the full recording to the provider.
+6. Choose **Stop** to cancel. Text already produced remains available.
+
+#### Hosted provider examples
+
+| Provider | Base URL | Example transcription model |
+|----------|----------|-----------------------------|
+| OpenAI | `https://api.openai.com/v1` | `whisper-1` |
+| Groq | `https://api.groq.com/openai/v1` | `whisper-large-v3` |
+
+Use a provider that supports the OpenAI-compatible
+`POST /audio/transcriptions` endpoint. Model names, availability, pricing, file
+limits, and supported formats vary by provider. Sravana sends the full audio
+recording directly to the configured endpoint over HTTPS; the provider's
+privacy and data-retention terms apply. Local Whisper remains available and
+does not upload recordings to a transcription API.
 
 Supported models: `tiny`, `base`, `small`, `medium`, `large-v2`, and `large-v3`.
 Only the most recently selected model stays in memory. Override the default CPU
@@ -112,8 +133,9 @@ by language, model, and audio.
 
 ### Does Sravana upload my audio to an online transcription API?
 
-No. In a self-hosted local install, audio is transcribed on the machine running
-the app. Internet access may be required once to download a Whisper model.
+In **Local Whisper** mode, audio is transcribed on the machine running the app.
+In **Hosted API** mode, the recording is sent to the provider you configured.
+Review its privacy and data-retention terms before using hosted transcription.
 
 ### What is the maximum audio file size?
 
@@ -141,10 +163,11 @@ recording quality affect speed and results.
 
 ## Is my audio sent to a transcription service?
 
-When you run Sravana on your own computer, transcription runs locally; audio is
-not sent to an external transcription API. An internet connection is needed to
-download a model the first time. Do not expose the local Gradio server to an
-untrusted network without adding appropriate access controls.
+When using Local Whisper on your own computer, transcription runs locally; an
+internet connection may be needed to download a model the first time. Hosted
+API mode sends audio to the configured provider. Do not expose the local
+Gradio server to an untrusted network without adding appropriate access
+controls.
 
 ## What file types and sizes are supported?
 
@@ -195,5 +218,6 @@ machine-generated transcript.
 ## License
 
 Powered by [Faster-Whisper](https://github.com/SYSTRAN/faster-whisper) and
-Whisper speech recognition models. Review the project and model licenses before
-redistributing or deploying.
+Whisper speech recognition models. Built by **Aadhya Labs**. Review the
+project, model, and hosted provider licenses and terms before redistributing
+or deploying.
